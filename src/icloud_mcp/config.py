@@ -37,6 +37,22 @@ def _local_timezone_name() -> str:
 
 
 ALL_CATEGORIES = frozenset({"calendar", "contacts", "email"})
+SAFE_MAIL_TOOLS = frozenset({
+    "email_list_folders", "email_list_messages", "email_search", "email_get_message",
+    "email_get_messages", "email_get_attachment", "email_send", "email_save_draft",
+})
+
+
+def _parse_enabled_tools(raw: str | None) -> frozenset[str] | None:
+    """Default to mail read/send/draft tools; all other access is explicit."""
+    if raw is None or not raw.strip() or raw.strip().lower() == "safe-mail":
+        return SAFE_MAIL_TOOLS
+    if raw.strip().lower() == "all":
+        return None
+    names = frozenset(name.strip() for name in raw.split(",") if name.strip())
+    if not names:
+        raise ValueError("ICLOUD_ENABLED_TOOLS must enable at least one tool")
+    return names
 
 
 def _parse_categories(raw: str | None) -> frozenset[str]:
@@ -86,18 +102,20 @@ class Config:
     # Which tool groups to expose: any of calendar, contacts, email (alias: mail).
     ENABLED_CATEGORIES: frozenset[str] = _parse_categories(os.getenv("ICLOUD_ENABLED_CATEGORIES"))
 
+    # Exact tool names, "safe-mail" (default), or "all" (explicit full access).
+    # This allowlist intersects ENABLED_CATEGORIES and applies to every transport.
+    ENABLED_TOOLS: frozenset[str] | None = _parse_enabled_tools(os.getenv("ICLOUD_ENABLED_TOOLS"))
+
     # How rich text stored in iCloud fields (event notes/location, contact notes)
     # is returned: "markdown" keeps links/emphasis/lists, "text" renders to plain
     # text, "raw" leaves it untouched.
     HTML_MODE: str = os.getenv("ICLOUD_HTML_MODE", "markdown").strip().lower()
 
-    # HTTP hardening. MCP_AUTH_TOKEN, when set, is required on every MCP request as
-    # ``Authorization: Bearer <token>`` or ``X-MCP-Token: <token>``. Environment
-    # credentials are honoured over HTTP only when a token protects the endpoint or
-    # ICLOUD_MCP_ALLOW_ENV_CREDENTIALS=true is set explicitly.
+    # HTTP requires MCP_AUTH_TOKEN on every MCP request as Authorization: Bearer
+    # or X-MCP-Token. ALLOW_ENV_CREDENTIALS cannot bypass endpoint authentication.
     MCP_AUTH_TOKEN: str | None = os.getenv("MCP_AUTH_TOKEN") or None
     ALLOW_ENV_CREDENTIALS: bool | None = _env_bool("ICLOUD_MCP_ALLOW_ENV_CREDENTIALS", None)
-    # Set at startup by server.main(); True unless disabled for an unprotected HTTP server.
+    # Set once at startup by server.main(); HTTP startup fails without a token.
     ENV_CREDENTIALS_ACTIVE: bool = True
 
     # Size limits
@@ -115,8 +133,8 @@ class Config:
     DEFAULT_TIMEZONE: str = os.getenv("DEFAULT_TIMEZONE") or _local_timezone_name()
 
     # Local filesystem access for attachments (save downloaded attachments,
-    # attach local files to outgoing mail). ``None`` means "decide by transport":
-    # enabled for stdio (the server runs on the user's machine), disabled for HTTP.
+    # attach local files to outgoing mail). Enabled by default for local stdio;
+    # HTTP always disables local-file access, even when this is explicitly true.
     LOCAL_FILES: bool | None = _env_bool("ICLOUD_MCP_LOCAL_FILES", None)
     LOCAL_FILES_ROOT: str | None = os.getenv("ICLOUD_MCP_LOCAL_FILES_ROOT") or None
 
@@ -128,6 +146,15 @@ class Config:
 config = Config()
 
 
+class SecretRedactingFormatter(logging.Formatter):
+    """Redact credentials from complete log messages, including tracebacks."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        from .auth import redact_secrets
+
+        return redact_secrets(super().format(record))
+
+
 def configure_logging(level: str | None = None) -> None:
     """Send all logs to stderr. stdout is reserved for the stdio MCP transport."""
     logging.basicConfig(
@@ -136,6 +163,15 @@ def configure_logging(level: str | None = None) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         force=True,
     )
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(SecretRedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    # Keep framework logs on the same redacting sink. The entrypoint prevents
+    # FastMCP/Uvicorn from replacing these handlers during HTTP startup.
+    for name in ("fastmcp", "uvicorn", "uvicorn.error", "uvicorn.access"):
+        framework_logger = logging.getLogger(name)
+        framework_logger.handlers.clear()
+        framework_logger.propagate = True
+        framework_logger.setLevel(getattr(logging, (level or config.LOG_LEVEL), logging.INFO))
     # Third-party libraries are chatty at INFO/DEBUG.
     for noisy in ("caldav", "urllib3", "niquests", "httpx", "imapclient"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

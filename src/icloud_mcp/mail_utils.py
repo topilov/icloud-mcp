@@ -16,6 +16,7 @@ import mimetypes
 import os
 import re
 import smtplib
+import ssl
 from dataclasses import asdict, dataclass
 from email import encoders
 from email.header import decode_header
@@ -73,14 +74,20 @@ def close_imap_client(client: IMAPClient | None) -> None:
 
 def get_smtp_client(username: str, password: str) -> smtplib.SMTP:
     client = smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT, timeout=60)
-    client.starttls()
     try:
+        client.starttls(context=ssl.create_default_context())
         client.login(username, password)
-    except smtplib.SMTPAuthenticationError as e:
-        client.quit()
-        raise PermissionError(
-            f"SMTP login failed for {username}: {e}. Use an app-specific password."
-        ) from e
+    except Exception as e:
+        # Never authenticate after a failed TLS handshake, or leave its socket open.
+        try:
+            client.close()
+        except Exception:
+            pass
+        if isinstance(e, smtplib.SMTPAuthenticationError):
+            raise PermissionError(
+                f"SMTP login failed for {username}: {e}. Use an app-specific password."
+            ) from e
+        raise
     return client
 
 
@@ -122,7 +129,7 @@ def append_to_sent(client: IMAPClient, raw_message: bytes) -> str | None:
             client.append(name, raw_message, flags=["\\Seen"])
             return name
         except Exception as e:
-            logger.debug("Append to %s failed: %s", name, e)
+            logger.debug("Append to Sent folder failed (%s)", type(e).__name__)
     logger.warning("Could not save message copy to any Sent folder")
     return None
 
@@ -138,24 +145,31 @@ def append_to_drafts(client: IMAPClient, raw_message: bytes) -> str:
 
 def move_messages(client: IMAPClient, uids: list[int], to_folder: str) -> None:
     """MOVE when the server supports it, else COPY + delete + UID EXPUNGE."""
+    if not uids:
+        return
     if client.has_capability("MOVE"):
         client.move(uids, to_folder)
         return
+    # Check before COPY or flag changes so an unsupported move has no side effects.
+    _require_uid_expunge(client)
     client.copy(uids, to_folder)
     client.delete_messages(uids)
-    _expunge(client, uids)
+    client.uid_expunge(uids)
 
 
-def _expunge(client: IMAPClient, uids: list[int]) -> None:
-    if client.has_capability("UIDPLUS"):
-        client.uid_expunge(uids)
-    else:
-        client.expunge()
+def _require_uid_expunge(client: IMAPClient) -> None:
+    if not client.has_capability("UIDPLUS"):
+        raise RuntimeError(
+            "Server does not support UIDPLUS; refusing to expunge unrelated deleted messages"
+        )
 
 
 def permanently_delete(client: IMAPClient, uids: list[int]) -> None:
+    if not uids:
+        return
+    _require_uid_expunge(client)
     client.delete_messages(uids)
-    _expunge(client, uids)
+    client.uid_expunge(uids)
 
 
 # ---------------------------------------------------------------------------

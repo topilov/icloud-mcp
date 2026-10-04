@@ -1,9 +1,11 @@
 """CardDAV operations for iCloud contacts (direct HTTP/WebDAV, RFC 6352)."""
 
+import ipaddress
 import logging
+import re
 import uuid
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import requests
 import vobject
@@ -13,12 +15,84 @@ from requests.auth import HTTPBasicAuth
 from .auth import require_auth
 from .config import config
 from .mail_utils import clean_rich_text
-from .urls import ensure_icloud_url
 
 logger = logging.getLogger(__name__)
 
 NS = {"d": "DAV:", "card": "urn:ietf:params:xml:ns:carddav"}
 TIMEOUT = 30
+_CARDDAV_DOMAINS = ("icloud.com", "icloud.com.cn", "me.com")
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+
+
+def _carddav_host(url: str) -> str:
+    """Parse a credential-free HTTPS endpoint without permissive URL rewriting."""
+    if not isinstance(url, str) or not url:
+        raise ValueError("CardDAV URL/ID is empty")
+    if any(ord(char) <= 32 or ord(char) == 127 for char in url) or "\\" in url:
+        raise ValueError("CardDAV URL must not contain whitespace, controls or backslashes")
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower().removesuffix(".")
+    except ValueError as exc:
+        raise ValueError("Invalid CardDAV URL") from exc
+    if parsed.scheme.lower() != "https" or not host:
+        raise ValueError("CardDAV URL must be a full https URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("CardDAV URL must not contain credentials")
+    if ":" in parsed.netloc:
+        raise ValueError("CardDAV URL must not contain a port or IP literal")
+    if parsed.fragment:
+        raise ValueError("CardDAV URL must not contain a fragment")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("CardDAV URL must not contain an IP literal")
+    labels = host.split(".")
+    if (
+        len(host) > 253
+        or not all(_DNS_LABEL.fullmatch(label) for label in labels)
+        or not labels[-1][0].isalpha()
+    ):
+        raise ValueError("CardDAV URL must contain a valid DNS hostname")
+    return host
+
+
+def _ensure_carddav_url(url: str) -> str:
+    """Allow the configured server and iCloud shards, including China mainland."""
+    host = _carddav_host(url)
+    configured_host = _carddav_host(config.CARDDAV_SERVER)
+    if host != configured_host and not any(
+        host == domain or host.endswith("." + domain) for domain in _CARDDAV_DOMAINS
+    ):
+        raise ValueError(f"Refusing CardDAV URL on untrusted host {host!r}")
+    return url
+
+
+def _carddav_href(base_url: str, href: str | None) -> str:
+    """Resolve and validate every server-supplied href before retaining it."""
+    _ensure_carddav_url(base_url)
+    if not href:
+        raise ValueError("CardDAV response is missing a resource href")
+    # urljoin strips some control characters; reject them before resolution.
+    if any(ord(char) <= 32 or ord(char) == 127 for char in href) or "\\" in href:
+        raise ValueError("Invalid CardDAV resource href")
+    return _ensure_carddav_url(urljoin(base_url, href))
+
+
+def _carddav_request(
+    session: requests.Session, method: str, url: str, **kwargs: Any
+) -> requests.Response:
+    """Never send Basic auth to an unchecked endpoint or follow a redirect."""
+    url = _ensure_carddav_url(url)
+    response = session.request(
+        method, url, timeout=TIMEOUT, allow_redirects=False, **kwargs
+    )
+    if 300 <= response.status_code < 400:
+        raise ValueError("CardDAV redirects are not allowed")
+    response.raise_for_status()
+    return response
 
 
 def _get_carddav_session(email: str, password: str) -> requests.Session:
@@ -33,14 +107,13 @@ def _get_carddav_session(email: str, password: str) -> requests.Session:
 def _discover_principal(session: requests.Session, base_url: str) -> str:
     body = """<?xml version="1.0" encoding="UTF-8"?>
     <d:propfind xmlns:d="DAV:"><d:prop><d:current-user-principal/></d:prop></d:propfind>"""
-    response = session.request(
-        "PROPFIND", base_url, data=body, headers={"Depth": "0"}, timeout=TIMEOUT
+    response = _carddav_request(
+        session, "PROPFIND", base_url, data=body, headers={"Depth": "0"}
     )
-    response.raise_for_status()
     root = ET.fromstring(response.content)
     elem = root.find(".//d:current-user-principal/d:href", NS)
     if elem is not None and elem.text:
-        return urljoin(base_url, elem.text)
+        return _carddav_href(base_url, elem.text)
     raise ValueError("Could not discover CardDAV principal URL")
 
 
@@ -49,14 +122,13 @@ def _discover_addressbook_home(session: requests.Session, principal_url: str) ->
     <d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
         <d:prop><card:addressbook-home-set/></d:prop>
     </d:propfind>"""
-    response = session.request(
-        "PROPFIND", principal_url, data=body, headers={"Depth": "0"}, timeout=TIMEOUT
+    response = _carddav_request(
+        session, "PROPFIND", principal_url, data=body, headers={"Depth": "0"}
     )
-    response.raise_for_status()
     root = ET.fromstring(response.content)
     elem = root.find(".//card:addressbook-home-set/d:href", NS)
     if elem is not None and elem.text:
-        return urljoin(principal_url, elem.text)
+        return _carddav_href(principal_url, elem.text)
     raise ValueError("Could not discover addressbook home URL")
 
 
@@ -65,10 +137,9 @@ def _list_addressbooks(session: requests.Session, home_url: str) -> list[dict[st
     <d:propfind xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
         <d:prop><d:displayname/><d:resourcetype/><card:addressbook-description/></d:prop>
     </d:propfind>"""
-    response = session.request(
-        "PROPFIND", home_url, data=body, headers={"Depth": "1"}, timeout=TIMEOUT
+    response = _carddav_request(
+        session, "PROPFIND", home_url, data=body, headers={"Depth": "1"}
     )
-    response.raise_for_status()
     root = ET.fromstring(response.content)
 
     addressbooks = []
@@ -80,7 +151,7 @@ def _list_addressbooks(session: requests.Session, home_url: str) -> list[dict[st
         name = resp.find(".//d:displayname", NS)
         addressbooks.append(
             {
-                "url": urljoin(home_url, href.text) if href is not None and href.text else "",
+                "url": _carddav_href(home_url, href.text if href is not None else None),
                 "name": name.text if name is not None and name.text else "Unnamed",
             }
         )
@@ -102,10 +173,9 @@ def _fetch_all_vcards(session: requests.Session, addressbook_url: str) -> list[d
     <card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
         <d:prop><d:getetag/><card:address-data/></d:prop>
     </card:addressbook-query>"""
-    response = session.request(
-        "REPORT", addressbook_url, data=body, headers={"Depth": "1"}, timeout=TIMEOUT
+    response = _carddav_request(
+        session, "REPORT", addressbook_url, data=body, headers={"Depth": "1"}
     )
-    response.raise_for_status()
 
     vcards = []
     root = ET.fromstring(response.content)
@@ -116,7 +186,7 @@ def _fetch_all_vcards(session: requests.Session, addressbook_url: str) -> list[d
         if data is not None and data.text:
             vcards.append(
                 {
-                    "url": urljoin(addressbook_url, href.text) if href is not None and href.text else "",
+                    "url": _carddav_href(addressbook_url, href.text if href is not None else None),
                     "data": data.text,
                     "etag": etag.text if etag is not None else "",
                 }
@@ -186,7 +256,7 @@ def list_contacts(limit: int | None = None) -> list[dict[str, Any]]:
         try:
             vcard = vobject.readOne(item["data"])
         except Exception as e:
-            logger.debug("Skipping unparsable vCard %s: %s", item["url"], e)
+            logger.debug("Skipping unparsable vCard (%s)", type(e).__name__)
             continue
         contact = _vcard_to_dict(vcard, item["url"])
         if contact["name"] or contact["phones"] or contact["emails"]:
@@ -195,11 +265,10 @@ def list_contacts(limit: int | None = None) -> list[dict[str, Any]]:
 
 
 def get_contact(contact_id: str) -> dict[str, Any]:
-    contact_id = ensure_icloud_url(contact_id, "contact")
+    contact_id = _ensure_carddav_url(contact_id)
     email, password = require_auth()
     session = _get_carddav_session(email, password)
-    response = session.get(contact_id, timeout=TIMEOUT)
-    response.raise_for_status()
+    response = _carddav_request(session, "GET", contact_id)
     return _vcard_to_dict(vobject.readOne(response.text), contact_id)
 
 
@@ -288,13 +357,13 @@ def create_contact(
     _apply_fields(vcard, phones, emails, addresses, organization, title, notes)
 
     contact_url = f"{addressbook_url}{unique_id}.vcf"
-    response = session.put(
+    _carddav_request(
+        session,
+        "PUT",
         contact_url,
         data=vcard.serialize().encode("utf-8"),
         headers={"Content-Type": "text/vcard; charset=utf-8", "If-None-Match": "*"},
-        timeout=TIMEOUT,
     )
-    response.raise_for_status()
     return _vcard_to_dict(vcard, contact_url)
 
 
@@ -308,12 +377,11 @@ def update_contact(
     title: str | None = None,
     notes: str | None = None,
 ) -> dict[str, Any]:
-    contact_id = ensure_icloud_url(contact_id, "contact")
+    contact_id = _ensure_carddav_url(contact_id)
     email, password = require_auth()
     session = _get_carddav_session(email, password)
 
-    response = session.get(contact_id, timeout=TIMEOUT)
-    response.raise_for_status()
+    response = _carddav_request(session, "GET", contact_id)
     etag = response.headers.get("ETag", "")
     vcard = vobject.readOne(response.text)
 
@@ -329,19 +397,17 @@ def update_contact(
     headers = {"Content-Type": "text/vcard; charset=utf-8"}
     if etag:
         headers["If-Match"] = etag
-    response = session.put(
-        contact_id, data=vcard.serialize().encode("utf-8"), headers=headers, timeout=TIMEOUT
+    _carddav_request(
+        session, "PUT", contact_id, data=vcard.serialize().encode("utf-8"), headers=headers
     )
-    response.raise_for_status()
     return _vcard_to_dict(vcard, contact_id)
 
 
 def delete_contact(contact_id: str) -> dict[str, str]:
-    contact_id = ensure_icloud_url(contact_id, "contact")
+    contact_id = _ensure_carddav_url(contact_id)
     email, password = require_auth()
     session = _get_carddav_session(email, password)
-    response = session.delete(contact_id, timeout=TIMEOUT)
-    response.raise_for_status()
+    _carddav_request(session, "DELETE", contact_id)
     return {"status": "success", "message": f"Contact {contact_id} deleted"}
 
 
