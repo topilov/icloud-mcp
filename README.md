@@ -107,6 +107,12 @@ Config file: macOS `~/Library/Application Support/Claude/claude_desktop_config.j
 
 ## Server mode (Streamable HTTP)
 
+For a mail-only Cloudflare Containers deployment with edge authentication,
+scale-to-zero defaults, and an optional Cloudflare Access OAuth front door, see
+[the Cloudflare preparation guide](cloudflare/README.md). Deployment and live
+OAuth/mailbox verification are separate steps; the default bearer configuration
+alone is not a ChatGPT plugin connection.
+
 ```bash
 icloud-mcp --http                      # 0.0.0.0:8000/mcp, stateless
 icloud-mcp --http --port 9000 --path /icloud --stateful

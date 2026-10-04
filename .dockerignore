@@ -15,3 +15,17 @@ venv/
 tests/
 docker-compose.yml
 .dockerignore
+# Never send local secrets, Worker state, or generated bundles to an image build.
+.env.*
+.dev.vars*
+.wrangler/
+.cloudflare/
+cloudflare/
+wrangler*.json*
+wrangler*.toml
+node_modules/
+package*.json
+tsconfig*.json
+.artifacts/
+artifacts/
+coverage/

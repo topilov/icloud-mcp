@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "icloud-mcp",
+  "main": "cloudflare/src/index.ts",
+  "compatibility_date": "2026-10-04",
+  "workers_dev": true,
+  "preview_urls": false,
+  "vars": { "AUTH_MODE": "bearer" },
+  // Application code never logs request headers, URLs, bodies, or secrets.
+  "observability": { "enabled": false },
+  "containers": [
+    {
+      "class_name": "IcloudMcpContainer",
+      "image": "./Dockerfile",
+      "instance_type": "lite",
+      "max_instances": 1
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "ICLOUD_MCP", "class_name": "IcloudMcpContainer" }
+    ]
+  },
+  "exports": {
+    "IcloudMcpContainer": { "type": "durable-object", "storage": "sqlite" }
+  }
+  // MCP_AUTH_TOKEN is a Worker secret, never a plaintext var or build argument.
+  // Optional mailbox secrets and deployment steps: cloudflare/README.md.
+}

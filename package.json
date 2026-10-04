@@ -1,0 +1,21 @@
+{
+  "name": "icloud-mcp-cloudflare",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.18.0" },
+  "scripts": {
+    "test": "node --test cloudflare/test/*.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "build:worker": "wrangler deploy --dry-run --containers-rollout=none --outdir .artifacts/cloudflare",
+    "dev": "wrangler dev --local-protocol https"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "0.3.7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20261004.1",
+    "typescript": "7.0.2",
+    "wrangler": "4.145.0"
+  }
+}
