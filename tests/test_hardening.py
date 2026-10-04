@@ -1,7 +1,6 @@
 """Security hardening: URL allow-list, header injection, token auth, credential policy."""
 
 import asyncio
-import logging
 
 import httpx
 import pytest
@@ -85,28 +84,28 @@ def test_parse_categories():
         _parse_categories(" , ")
 
 
-def test_http_credential_policy(monkeypatch, caplog):
-    monkeypatch.setattr(config, "FALLBACK_EMAIL", "a@icloud.com")
-    monkeypatch.setattr(config, "FALLBACK_PASSWORD", "pw")
-
+def test_http_credential_policy(monkeypatch):
+    monkeypatch.setattr(config, "ENV_CREDENTIALS_ACTIVE", True)
     monkeypatch.setattr(config, "MCP_AUTH_TOKEN", None)
     monkeypatch.setattr(config, "ALLOW_ENV_CREDENTIALS", None)
-    with caplog.at_level(logging.WARNING):
-        assert server._http_credential_policy() == []
+    with pytest.raises(ValueError, match="MCP_AUTH_TOKEN is required"):
+        server._http_credential_policy()
     assert config.ENV_CREDENTIALS_ACTIVE is False
-    assert "ignored over HTTP" in caplog.text
 
     monkeypatch.setattr(config, "MCP_AUTH_TOKEN", "s3cret")
     middleware = server._http_credential_policy()
     assert config.ENV_CREDENTIALS_ACTIVE is True
     assert len(middleware) == 1
 
+    monkeypatch.setattr(config, "ALLOW_ENV_CREDENTIALS", False)
+    assert len(server._http_credential_policy()) == 1
+    assert config.ENV_CREDENTIALS_ACTIVE is False
+
     monkeypatch.setattr(config, "MCP_AUTH_TOKEN", None)
     monkeypatch.setattr(config, "ALLOW_ENV_CREDENTIALS", True)
-    server._http_credential_policy()
-    assert config.ENV_CREDENTIALS_ACTIVE is True
-
-    config.ENV_CREDENTIALS_ACTIVE = True  # restore for other tests
+    with pytest.raises(ValueError, match="MCP_AUTH_TOKEN is required"):
+        server._http_credential_policy()
+    assert config.ENV_CREDENTIALS_ACTIVE is False
 
 
 def test_env_credentials_ignored_when_inactive(monkeypatch):
@@ -129,6 +128,8 @@ def test_token_middleware():
             transport=transport, base_url="http://test"
         ) as client:
             health = await client.get("/health")
+            health_post = await client.post("/health", json={})
+            assert health_post.status_code == 401
             anon = await client.post("/mcp", json={})
             wrong = await client.post("/mcp", json={}, headers={"Authorization": "Bearer nope"})
             bearer = await client.post("/mcp", json={}, headers={"Authorization": "Bearer s3cret"})

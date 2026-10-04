@@ -6,15 +6,18 @@ services:
     ports:
       - "127.0.0.1:${MCP_SERVER_PORT:-8000}:8000"
     environment:
-      # Shared secret required on every MCP request. Without it the fallback
-      # credentials below are ignored over HTTP.
+      # Startup fails closed unless this shared secret is set.
       MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
       # Optional fallback credentials; clients can send them per request instead
       # (X-Apple-Email / X-Apple-App-Specific-Password headers or HTTP Basic auth).
       ICLOUD_EMAIL: ${ICLOUD_EMAIL:-}
       ICLOUD_APP_SPECIFIC_PASSWORD: ${ICLOUD_APP_SPECIFIC_PASSWORD:-}
+      ICLOUD_MCP_ALLOW_ENV_CREDENTIALS: ${ICLOUD_MCP_ALLOW_ENV_CREDENTIALS:-true}
       DEFAULT_TIMEZONE: ${DEFAULT_TIMEZONE:-UTC}
       ICLOUD_ENABLED_CATEGORIES: ${ICLOUD_ENABLED_CATEGORIES:-calendar,contacts,email}
+      ICLOUD_ENABLED_TOOLS: ${ICLOUD_ENABLED_TOOLS:-safe-mail}
+      EMAIL_SEND_ALLOWLIST: ${EMAIL_SEND_ALLOWLIST:-}
+      ICLOUD_MCP_LOCAL_FILES: "false"
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       PORT: 8000
     restart: unless-stopped

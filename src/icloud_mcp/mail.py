@@ -79,7 +79,7 @@ def _fetch_summaries(
                 item["has_attachments"] = _bodystructure_has_attachments(data)
             result.append(item)
         except Exception as e:
-            logger.debug("Skipping message %s: %s", uid, e)
+            logger.debug("Skipping unparsable message (%s)", type(e).__name__)
     return result
 
 
@@ -157,6 +157,20 @@ def search_messages(
     limit: int = 50,
     include_body: bool = True,
 ) -> list[dict[str, Any]]:
+    # Validate the original values before date parsing, IMAP, or local fallbacks.
+    for name, value in (
+        ("query", query),
+        ("sender", sender),
+        ("recipient", recipient),
+        ("subject", subject),
+        ("body", body),
+        ("since", since),
+        ("before", before),
+        ("folder", folder),
+    ):
+        if value is not None and any(char in value for char in ("\r", "\n", "\x00")):
+            raise ValueError(f"{name} must not contain CR, LF or NUL characters")
+
     if not any([query, sender, recipient, subject, body, since, before, unread_only]):
         raise ValueError(
             "Provide at least one filter: query, sender, recipient, subject, body, since, before or unread_only"
@@ -191,7 +205,7 @@ def search_messages(
         except Exception as e:
             # Some servers reject CHARSET UTF-8; fall back to ASCII search when possible,
             # otherwise to a local scan of recent headers.
-            logger.warning("UTF-8 IMAP search failed (%s); falling back", e)
+            logger.warning("UTF-8 IMAP search failed (%s); falling back", type(e).__name__)
             try:
                 uids = list(client.search(criteria))
             except Exception:
@@ -422,7 +436,7 @@ def send_message(
         finally:
             close_imap_client(client)
     except Exception as e:
-        logger.warning("Could not save sent copy: %s", e)
+        logger.warning("Could not save sent copy (%s)", type(e).__name__)
 
     result: dict[str, Any] = {
         "status": "success",
@@ -518,8 +532,10 @@ def delete_message(message_id: str, folder: str = "INBOX", permanent: bool = Fal
                 "or move the message with email_move."
             )
         if folder.lower() == trash.lower():
-            permanently_delete(client, [uid])
-            return {"status": "success", "message": f"Message {message_id} permanently deleted from {trash}"}
+            raise ValueError(
+                f"Message {message_id} is already in {trash}. "
+                "Pass permanent=true to delete permanently."
+            )
         move_messages(client, [uid], trash)
         return {"status": "success", "message": f"Message {message_id} moved to {trash}"}
     finally:

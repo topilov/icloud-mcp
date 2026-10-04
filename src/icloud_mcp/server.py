@@ -39,11 +39,20 @@ mcp = FastMCP(
     website_url="https://github.com/mike-tih/icloud-mcp",
 )
 
+_declared_tools: set[str] = set()
+
+
 def tool(category: str, **kwargs):
-    """Register a tool only when its category is enabled (ICLOUD_ENABLED_CATEGORIES)."""
-    if category not in config.ENABLED_CATEGORIES:
-        return lambda fn: fn
-    return mcp.tool(**kwargs)
+    """Register only tools allowed by both category and exact-name allowlists."""
+    def decorate(fn):
+        _declared_tools.add(fn.__name__)
+        if category not in config.ENABLED_CATEGORIES:
+            return fn
+        if config.ENABLED_TOOLS is not None and fn.__name__ not in config.ENABLED_TOOLS:
+            return fn
+        return mcp.tool(**kwargs)(fn)
+
+    return decorate
 
 
 READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}
@@ -66,24 +75,24 @@ def _run(fn, *args, **kwargs):
     """Execute an operation and translate failures into MCP tool errors."""
     try:
         return fn(*args, **kwargs)
-    except ToolError:
-        raise
+    except ToolError as e:
+        raise ToolError(redact_secrets(str(e))) from None
     except AuthenticationError as e:
-        raise ToolError(f"Authentication required: {e}") from e
+        raise ToolError(redact_secrets(f"Authentication required: {e}")) from None
     except (PermissionError, FileNotFoundError, ValueError) as e:
-        raise ToolError(redact_secrets(str(e))) from e
+        raise ToolError(redact_secrets(str(e))) from None
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else None
         if status in (401, 403):
-            raise ToolError(f"HTTP {status}: {AUTH_HINT}") from e
-        raise ToolError(redact_secrets(f"iCloud returned HTTP {status}: {e}")) from e
+            raise ToolError(f"HTTP {status}: {AUTH_HINT}") from None
+        raise ToolError(redact_secrets(f"iCloud returned HTTP {status}: {e}")) from None
     except Exception as e:
         name = type(e).__name__
         text = str(e)
         if "401" in text or "Unauthorized" in text or "AuthorizationError" in name:
-            raise ToolError(f"{name}: {AUTH_HINT} ({text})") from e
-        logger.exception("Tool failed: %s", fn.__name__)
-        raise ToolError(redact_secrets(f"{name}: {text}")) from e
+            raise ToolError(f"{name}: {AUTH_HINT}") from None
+        logger.error("Tool failed: %s (%s)", fn.__name__, name)
+        raise ToolError(redact_secrets(f"{name}: {text}")) from None
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +482,12 @@ def email_mark_unread(message_id: MessageId, folder: Folder = "INBOX") -> dict[s
 # ---------------------------------------------------------------------------
 
 
+if config.ENABLED_TOOLS is not None:
+    unknown_tools = config.ENABLED_TOOLS - _declared_tools
+    if unknown_tools:
+        raise ValueError(f"Unknown tools in ICLOUD_ENABLED_TOOLS: {', '.join(sorted(unknown_tools))}")
+
+
 class TokenAuthMiddleware:
     """Require a shared secret on every MCP request (``Authorization: Bearer`` or ``X-MCP-Token``)."""
 
@@ -482,7 +497,9 @@ class TokenAuthMiddleware:
         self.exempt_paths = exempt_paths
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope.get("path") in self.exempt_paths:
+        if scope["type"] != "http" or (
+            scope.get("path") in self.exempt_paths and scope.get("method") in {"GET", "HEAD"}
+        ):
             await self.app(scope, receive, send)
             return
         headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
@@ -490,7 +507,7 @@ class TokenAuthMiddleware:
         auth = headers.get("authorization", "")
         if not presented and auth.lower().startswith("bearer "):
             presented = auth[7:].strip()
-        if presented and hmac.compare_digest(presented, self.token):
+        if presented and hmac.compare_digest(presented.encode("utf-8"), self.token.encode("utf-8")):
             await self.app(scope, receive, send)
             return
         from starlette.responses import JSONResponse
@@ -518,30 +535,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _http_credential_policy() -> list:
-    """Decide whether environment credentials may serve HTTP requests; build auth middleware.
+    """Fail closed: no HTTP listener starts without endpoint authentication."""
+    config.ENV_CREDENTIALS_ACTIVE = False
+    token = config.MCP_AUTH_TOKEN
+    if not token or not token.strip():
+        raise ValueError("MCP_AUTH_TOKEN is required for HTTP; refusing to start an unprotected endpoint")
+    config.ENV_CREDENTIALS_ACTIVE = config.ALLOW_ENV_CREDENTIALS is not False
+    from starlette.middleware import Middleware
 
-    Environment credentials are honoured over HTTP only when MCP_AUTH_TOKEN protects the
-    endpoint or the operator opted in with ICLOUD_MCP_ALLOW_ENV_CREDENTIALS=true.
-    """
-    has_env_creds = bool(config.FALLBACK_EMAIL and config.FALLBACK_PASSWORD)
-    allow_env = config.ALLOW_ENV_CREDENTIALS
-    if allow_env is None:
-        allow_env = bool(config.MCP_AUTH_TOKEN)
-    config.ENV_CREDENTIALS_ACTIVE = allow_env
-    if has_env_creds and not allow_env:
-        logger.warning(
-            "ICLOUD_EMAIL/ICLOUD_APP_SPECIFIC_PASSWORD are set but ignored over HTTP because the "
-            "endpoint is unprotected. Set MCP_AUTH_TOKEN, or ICLOUD_MCP_ALLOW_ENV_CREDENTIALS=true "
-            "to serve the environment account to anyone who can reach this port."
-        )
-    if not config.MCP_AUTH_TOKEN:
-        logger.warning("MCP_AUTH_TOKEN is not set: the HTTP endpoint accepts requests from anyone.")
-    middleware = []
-    if config.MCP_AUTH_TOKEN:
-        from starlette.middleware import Middleware
-
-        middleware.append(Middleware(TokenAuthMiddleware, token=config.MCP_AUTH_TOKEN))
-    return middleware
+    return [Middleware(TokenAuthMiddleware, token=token)]
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -550,12 +552,16 @@ def main(argv: list[str] | None = None) -> None:
 
     use_http = args.http or os.getenv("MCP_TRANSPORT", "").lower() in {"http", "streamable-http"}
 
-    # Local file access (attachments on disk) is safe when the server runs on the
-    # user's own machine, and off by default for a shared HTTP deployment.
-    if config.LOCAL_FILES is None:
-        config.LOCAL_FILES = not use_http
+    # A remote caller must never read or write files on the HTTP server's disk.
+    # Local stdio callers retain the configurable attachment-file workflow.
+    if use_http:
+        config.LOCAL_FILES = False
+    elif config.LOCAL_FILES is None:
+        config.LOCAL_FILES = True
 
     if use_http:
+        if args.path.rstrip("/") == "/health":
+            raise ValueError("MCP_SERVER_PATH must not use the public /health endpoint")
         middleware = _http_credential_policy()
 
         logger.info(
@@ -569,7 +575,9 @@ def main(argv: list[str] | None = None) -> None:
             path=args.path,
             stateless_http=not args.stateful,
             show_banner=False,
-            log_level=args.log_level.lower(),
+            # Do not pass FastMCP log_level: it replaces the redacting handler.
+            # Keep Uvicorn on our sink too, and avoid logging request URLs.
+            uvicorn_config={"log_config": None, "access_log": False, "log_level": args.log_level.lower()},
             middleware=middleware,
         )
     else:

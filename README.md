@@ -107,6 +107,12 @@ Config file: macOS `~/Library/Application Support/Claude/claude_desktop_config.j
 
 ## Server mode (Streamable HTTP)
 
+For a mail-only Cloudflare Containers deployment with edge authentication,
+scale-to-zero defaults, and an optional Cloudflare Access OAuth front door, see
+[the Cloudflare preparation guide](cloudflare/README.md). Deployment and live
+OAuth/mailbox verification are separate steps; the default bearer configuration
+alone is not a ChatGPT plugin connection.
+
 ```bash
 icloud-mcp --http                      # 0.0.0.0:8000/mcp, stateless
 icloud-mcp --http --port 9000 --path /icloud --stateful
@@ -115,7 +121,7 @@ icloud-mcp --http --port 9000 --path /icloud --stateful
 Or with Docker:
 
 ```bash
-docker compose up -d                   # reads .env for optional fallback credentials
+docker compose up -d                   # requires MCP_AUTH_TOKEN in .env; fallback mailbox credentials optional
 curl http://localhost:8000/health
 ```
 
@@ -131,7 +137,7 @@ Checked in order:
 
 ### Protecting the endpoint
 
-Set `MCP_AUTH_TOKEN` to a long random secret. Every MCP request must then carry it as `Authorization: Bearer <token>` or `X-MCP-Token: <token>` (`/health` stays open). Without a token the server logs a warning and **ignores the environment credentials over HTTP**, so an unprotected port can never hand out the operator's account; per-request credentials still work. Set `ICLOUD_MCP_ALLOW_ENV_CREDENTIALS=true` only if you really want an open endpoint bound to one account (e.g. on a private network). `docker-compose.yml` publishes the port on `127.0.0.1` only.
+Set `MCP_AUTH_TOKEN` to a long random secret. **HTTP startup fails without it**, even when per-request mailbox credentials are used or `ICLOUD_MCP_ALLOW_ENV_CREDENTIALS=true` is set. Every MCP request must carry the token as `Authorization: Bearer <token>` or `X-MCP-Token: <token>` (`/health` stays open). Set `ICLOUD_MCP_ALLOW_ENV_CREDENTIALS=false` to disable environment credential fallback. `docker-compose.yml` publishes the port on `127.0.0.1` only; use a TLS reverse proxy for remote access. Run HTTP through the supported `icloud-mcp --http` entrypoint so this policy is installed.
 
 ```bash
 MCP_AUTH_TOKEN=$(openssl rand -hex 32) icloud-mcp --http
@@ -144,10 +150,33 @@ Example with Claude Code against a remote server:
 
 ```bash
 claude mcp add --transport http icloud https://mcp.example.com/mcp \
+  -H "Authorization: Bearer <token>" \
   -H "X-Apple-Email: you@icloud.com" -H "X-Apple-App-Specific-Password: xxxx-xxxx-xxxx-xxxx"
 ```
 
 Always put the server behind HTTPS: app-specific passwords travel in headers.
+
+### Restricted tool surface
+
+The default `ICLOUD_ENABLED_TOOLS=safe-mail` exposes only `email_list_folders`,
+`email_list_messages`, `email_search`, `email_get_message`, `email_get_messages`,
+`email_get_attachment`, `email_send`, and `email_save_draft`. Delete, move,
+read-state changes, calendar tools, and contacts tools are not registered.
+This default applies to both HTTP and stdio; it changes the previous full-access default.
+
+Set a comma-separated list of exact tool names for a smaller or custom surface,
+or explicitly set `ICLOUD_ENABLED_TOOLS=all` to restore the full tool set.
+The tool allowlist intersects `ICLOUD_ENABLED_CATEGORIES`; unknown tool names fail
+startup. Use `EMAIL_SEND_ALLOWLIST` to restrict recipients of mail, drafts, and
+calendar invitations/cancellations. An empty recipient allowlist allows any
+recipient, so sending still requires appropriate authorization from the caller.
+Docker Compose forwards both allowlists and keeps local attachment files disabled.
+
+Mail deletion defaults to moving messages to Trash. Repeating this in Trash is
+refused unless `permanent=true` is explicitly requested. Permanent deletion and
+COPY-based moves require UIDPLUS; there is no mailbox-wide EXPUNGE fallback.
+CardDAV endpoints and discovered hrefs must use trusted HTTPS hosts; redirects
+are rejected rather than following them with mailbox credentials.
 
 ## Configuration
 
@@ -160,11 +189,12 @@ All settings are environment variables (a `.env` file next to the checkout is lo
 | `EMAIL_BODY_MAX_CHARS` | `20000` | Body truncation |
 | `EMAIL_MAX_ATTACHMENT_BYTES` | `20971520` | Outgoing attachment budget |
 | `EMAIL_SEND_ALLOWLIST` | – | Allowed outbound addresses/domains (send, drafts, invitations) |
-| `ICLOUD_MCP_LOCAL_FILES` | stdio: on, HTTP: off | Allow reading/writing attachments on the server's disk |
+| `ICLOUD_MCP_LOCAL_FILES` | stdio: on, HTTP: always off | Allow attachment-file reads/writes in stdio only |
 | `ICLOUD_MCP_LOCAL_FILES_ROOT` | – | Confine those files to a directory |
-| `MCP_AUTH_TOKEN` | – | Shared secret required on HTTP requests |
-| `ICLOUD_MCP_ALLOW_ENV_CREDENTIALS` | true with token, else false | Serve the env account over HTTP |
+| `MCP_AUTH_TOKEN` | – | Required for HTTP startup and every MCP request |
+| `ICLOUD_MCP_ALLOW_ENV_CREDENTIALS` | true with token | Serve the env account over authenticated HTTP; cannot bypass token auth |
 | `ICLOUD_ENABLED_CATEGORIES` | `calendar,contacts,email` | Tool groups to expose |
+| `ICLOUD_ENABLED_TOOLS` | `safe-mail` | Exact tool-name allowlist, `safe-mail`, or explicit `all` |
 | `ICLOUD_HTML_MODE` | `markdown` | Rich text in event/contact fields: `markdown`, `text` or `raw` |
 | `MCP_TRANSPORT`, `PORT`, `MCP_SERVER_HOST`, `MCP_SERVER_PATH` | stdio, `8000`, `0.0.0.0`, `/mcp` | HTTP transport |
 | `LOG_LEVEL` | `INFO` | Logging (always to stderr, stdout is reserved for stdio) |
@@ -183,7 +213,7 @@ All settings are environment variables (a `.env` file next to the checkout is lo
 
 ```bash
 uv pip install -e ".[dev]"
-pytest              # unit tests + end-to-end through the MCP protocol with mocked IMAP
+pytest              # unit/protocol tests with mocked transports and blocked outbound sockets/DNS
 ruff check src tests
 ```
 

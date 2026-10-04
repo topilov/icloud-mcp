@@ -45,3 +45,14 @@ htmlcov/
 .venv/
 .ruff_cache/
 uv.lock
+
+# Cloudflare / Node local state and secrets
+node_modules/
+.wrangler/
+.cloudflare/
+.dev.vars*
+.env.*
+!.env.example
+.artifacts/
+artifacts/
+coverage/

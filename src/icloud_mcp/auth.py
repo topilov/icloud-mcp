@@ -82,11 +82,26 @@ def require_auth() -> tuple[str, str]:
 
 
 def redact_secrets(text: str) -> str:
-    """Remove the current request's password from a message before it leaves the server."""
+    """Remove request and configured secrets before errors or logs leave the server."""
+    secrets = {config.FALLBACK_PASSWORD, config.MCP_AUTH_TOKEN}
+    headers = _request_headers()
+    secrets.update((headers.get("x-apple-app-specific-password"), headers.get("x-mcp-token")))
+    authorization = headers.get("authorization")
+    if authorization:
+        secrets.add(authorization)
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() in {"basic", "bearer"}:
+            secrets.add(value.strip())
+        _, password = _from_basic_auth(authorization)
+        secrets.add(password)
     try:
         _, password = get_credentials()
+        secrets.add(password)
     except Exception:
-        return text
-    if password and password in text:
-        text = text.replace(password, "***")
+        pass
+    for secret in tuple(secrets):
+        if secret:
+            secrets.add(secret.strip().replace(" ", ""))
+    for secret in sorted((value for value in secrets if value), key=len, reverse=True):
+        text = text.replace(secret, "***")
     return text

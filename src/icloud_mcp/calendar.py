@@ -10,6 +10,7 @@ RRULE support, IANA timezone handling and iTIP invitations over SMTP.
 import logging
 import re
 import smtplib
+import ssl
 from datetime import UTC, date, datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -159,7 +160,7 @@ def _vtimezone_block(tzid: str, first: date, last: date) -> str:
         )
         return component.to_ical().decode("utf-8").replace("\r\n", "\n").strip()
     except Exception as e:  # pragma: no cover - depends on icalendar internals
-        logger.debug("Could not build VTIMEZONE for %s: %s", tzid, e)
+        logger.debug("Could not build VTIMEZONE (%s)", type(e).__name__)
         return ""
 
 
@@ -399,14 +400,17 @@ def _send_calendar_invitation(
 
     smtp_client = smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT, timeout=30)
     try:
-        smtp_client.starttls()
+        smtp_client.starttls(context=ssl.create_default_context())
         smtp_client.login(organizer_email, organizer_password)
         smtp_client.send_message(msg, from_addr=organizer_email, to_addrs=[attendee_email])
     finally:
         try:
             smtp_client.quit()
         except Exception:
-            pass
+            try:
+                smtp_client.close()
+            except Exception:
+                pass
 
     try:
         imap_client = _get_imap_client(organizer_email, organizer_password)
@@ -415,7 +419,7 @@ def _send_calendar_invitation(
         finally:
             _close_imap_client(imap_client)
     except Exception as e:
-        logger.warning("Could not save invitation copy to Sent: %s", e)
+        logger.warning("Could not save invitation copy to Sent (%s)", type(e).__name__)
 
 
 def _notify_attendees(
@@ -430,6 +434,7 @@ def _notify_attendees(
     method: str,
 ) -> list[str]:
     """Send iTIP mail to each attendee; returns the list of failures."""
+    attendees = _validate_attendees(attendees)
     failed = []
     for attendee_email in attendees:
         if attendee_email.lower() == email.lower():
@@ -439,7 +444,7 @@ def _notify_attendees(
                 email, password, attendee_email, ical_data, summary, start, end, location, method
             )
         except Exception as e:
-            logger.error("Failed to send %s to %s: %s", method, attendee_email, e)
+            logger.error("Failed to send calendar notification %s (%s)", method, type(e).__name__)
             failed.append(attendee_email)
     return failed
 
@@ -497,7 +502,7 @@ def list_events(
             # series master and overwrites the expanded occurrence.
             events = calendar.search(start=start, end=end, event=True, expand=True)
         except Exception as e:
-            logger.warning("Search failed for calendar %s: %s", calendar.url, e)
+            logger.warning("Calendar search failed (%s)", type(e).__name__)
             continue
 
         try:
@@ -512,7 +517,7 @@ def list_events(
                 vevent = event.vobject_instance.vevent
                 result.append(_vevent_to_dict(vevent, str(event.url), calendar_name))
             except Exception as e:
-                logger.debug("Skipping malformed event %s: %s", getattr(event, "url", "?"), e)
+                logger.debug("Skipping malformed event (%s)", type(e).__name__)
                 continue
 
     result.sort(key=lambda item: item.get("start") or "")
@@ -841,7 +846,12 @@ def delete_event(event_id: str) -> dict[str, Any]:
         snapshot = _vevent_to_dict(vevent, event_id, "")
         ical_data = event.vobject_instance.serialize()
     except Exception as e:
-        logger.warning("Could not load event before deletion: %s", e)
+        logger.warning("Could not load event before deletion (%s)", type(e).__name__)
+
+    # Validate outside the best-effort load block, before deleting or sending
+    # anything. Stored attendees are just as untrusted as newly supplied ones.
+    if snapshot:
+        snapshot["attendees"] = _validate_attendees(snapshot["attendees"])
 
     event.delete()
 
